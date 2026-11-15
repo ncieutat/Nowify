@@ -8,7 +8,7 @@
  * Config object.
  */
 const config = {
-  authNamespace: 'nowify_auth_state'
+  authNamespace: 'nowify_auth_state_v2'
 }
 
 /**

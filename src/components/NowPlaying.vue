@@ -4,6 +4,7 @@
       v-if="player.playing"
       class="now-playing"
       :class="getNowPlayingClass()"
+      @click="showControls"
     >
       <div class="now-playing__cover">
         <img
@@ -15,6 +16,47 @@
       <div class="now-playing__details">
         <h1 class="now-playing__track" v-text="player.trackTitle"></h1>
         <h2 class="now-playing__artists" v-text="getTrackArtists"></h2>
+
+        <div
+          class="now-playing__progress"
+          :class="{ 'now-playing__progress--seekable': controlsVisible }"
+          @click.stop="seekFromTap"
+        >
+          <div
+            class="now-playing__progress-fill"
+            :style="{ width: progressPercent + '%' }"
+          ></div>
+        </div>
+        <p class="now-playing__time">
+          <span v-text="formatTime(progressMs)"></span>
+          <span v-text="formatTime(durationMs)"></span>
+        </p>
+
+        <div
+          class="now-playing__controls"
+          :class="{ 'now-playing__controls--visible': controlsVisible }"
+        >
+          <button
+            class="now-playing__control"
+            aria-label="Previous track"
+            @click.stop="previousTrack"
+          >
+            &#9198;
+          </button>
+          <button
+            class="now-playing__control now-playing__control--main"
+            :aria-label="isPaused ? 'Play' : 'Pause'"
+            @click.stop="togglePlay"
+            v-html="isPaused ? '&#9654;' : '&#9208;'"
+          ></button>
+          <button
+            class="now-playing__control"
+            aria-label="Next track"
+            @click.stop="nextTrack"
+          >
+            &#9197;
+          </button>
+        </div>
       </div>
     </div>
     <div v-else class="now-playing" :class="getNowPlayingClass()">
@@ -27,6 +69,11 @@
 import * as Vibrant from 'node-vibrant'
 
 import props from '@/utils/props.js'
+
+/**
+ * How long the controls stay on screen after a tap (ms).
+ */
+const CONTROLS_TIMEOUT = 5000
 
 export default {
   name: 'NowPlaying',
@@ -43,7 +90,15 @@ export default {
       playerResponse: {},
       playerData: this.getEmptyPlayer(),
       colourPalette: '',
-      swatches: []
+      swatches: [],
+
+      // Progress and controls
+      progressMs: 0,
+      durationMs: 0,
+      isPaused: false,
+      progressTick: '',
+      controlsVisible: false,
+      controlsTimer: ''
     }
   },
 
@@ -54,15 +109,29 @@ export default {
      */
     getTrackArtists() {
       return this.player.trackArtists.join(', ')
+    },
+
+    /**
+     * How far through the song we are, 0–100.
+     * @return {Number}
+     */
+    progressPercent() {
+      if (!this.durationMs) {
+        return 0
+      }
+      return Math.min(100, (this.progressMs / this.durationMs) * 100)
     }
   },
 
   mounted() {
     this.setDataInterval()
+    this.startProgressTick()
   },
 
   beforeDestroy() {
     clearInterval(this.pollPlaying)
+    clearInterval(this.progressTick)
+    clearTimeout(this.controlsTimer)
   },
 
   methods: {
@@ -106,6 +175,15 @@ export default {
         }
 
         data = await response.json()
+
+        /**
+         * Sync progress and play state on every poll, not just on
+         * track change, so the bar stays accurate.
+         */
+        this.progressMs = data.progress_ms || 0
+        this.durationMs = data.item?.duration_ms || 0
+        this.isPaused = data.is_playing === false
+
         this.playerResponse = data
       } catch (error) {
         this.handleExpiredToken()
@@ -117,6 +195,120 @@ export default {
           this.$emit('spotifyTrackUpdated', data)
         })
       }
+    },
+
+    /**
+     * Send a playback command to Spotify.
+     * Requires the user-modify-playback-state scope and Spotify Premium.
+     * @param {String} method - HTTP method (POST or PUT).
+     * @param {String} path - path under /me/player.
+     */
+    async sendPlayerCommand(method, path) {
+      try {
+        const response = await fetch(
+          `${this.endpoints.base}/me/player/${path}`,
+          {
+            method,
+            headers: {
+              Authorization: `Bearer ${this.auth.accessToken}`
+            }
+          }
+        )
+
+        if (response.status === 401) {
+          this.handleExpiredToken()
+          return
+        }
+
+        if (!response.ok) {
+          // 403 usually means the token lacks the new scope: log in again.
+          // 404 means no active Spotify device.
+          // eslint-disable-next-line no-console
+          console.warn(`Player command failed: ${response.status}`)
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn('Player command error', error)
+      }
+
+      // Re-sync shortly after, rather than waiting for the next poll.
+      setTimeout(() => this.getNowPlaying(), 400)
+    },
+
+    nextTrack() {
+      this.showControls()
+      this.sendPlayerCommand('POST', 'next')
+    },
+
+    previousTrack() {
+      this.showControls()
+      this.sendPlayerCommand('POST', 'previous')
+    },
+
+    togglePlay() {
+      this.showControls()
+      const command = this.isPaused ? 'play' : 'pause'
+      this.isPaused = !this.isPaused // update the button immediately
+      this.sendPlayerCommand('PUT', command)
+    },
+
+    /**
+     * Jump to the tapped point on the progress bar.
+     * Only works while the controls are showing, so a stray
+     * touch on the bar can't skip you through a song.
+     */
+    seekFromTap(event) {
+      if (!this.controlsVisible || !this.durationMs) {
+        this.showControls()
+        return
+      }
+
+      const bar = event.currentTarget.getBoundingClientRect()
+      const fraction = Math.min(
+        1,
+        Math.max(0, (event.clientX - bar.left) / bar.width)
+      )
+      const positionMs = Math.round(fraction * this.durationMs)
+
+      this.progressMs = positionMs
+      this.showControls()
+      this.sendPlayerCommand('PUT', `seek?position_ms=${positionMs}`)
+    },
+
+    /**
+     * Show the controls, then hide them after CONTROLS_TIMEOUT.
+     */
+    showControls() {
+      this.controlsVisible = true
+      clearTimeout(this.controlsTimer)
+      this.controlsTimer = setTimeout(() => {
+        this.controlsVisible = false
+      }, CONTROLS_TIMEOUT)
+    },
+
+    /**
+     * Advance the progress bar once a second between polls,
+     * so it slides smoothly instead of jumping every 2.5s.
+     */
+    startProgressTick() {
+      clearInterval(this.progressTick)
+      this.progressTick = setInterval(() => {
+        if (!this.isPaused && this.durationMs) {
+          this.progressMs = Math.min(this.progressMs + 1000, this.durationMs)
+        }
+      }, 1000)
+    },
+
+    /**
+     * Turn milliseconds into m:ss.
+     * @param {Number} ms
+     * @return {String}
+     */
+    formatTime(ms) {
+      const totalSeconds = Math.floor((ms || 0) / 1000)
+      const minutes = Math.floor(totalSeconds / 60)
+      const seconds = String(totalSeconds % 60).padStart(2, '0')
+      return `${minutes}:${seconds}`
     },
 
     /**
@@ -204,11 +396,11 @@ export default {
       }
 
       /**
-       * Player is active, but user has paused.
+       * Nothing to show (e.g. an ad or a podcast with no track item).
+       * Paused tracks are no longer cleared here: the screen keeps
+       * the cover up so the play button stays reachable.
        */
-      if (this.playerResponse.is_playing === false) {
-        this.playerData = this.getEmptyPlayer()
-
+      if (!this.playerResponse.item) {
         return
       }
 
@@ -216,15 +408,17 @@ export default {
        * The newly fetched track is the same as our stored
        * one, we don't want to update the DOM yet.
        */
-      if (this.playerResponse.item?.id === this.playerData.trackId) {
+      if (this.playerResponse.item.id === this.playerData.trackId) {
         return
       }
 
       /**
        * Store the current active track.
+       * `playing` here means "there is a track to show",
+       * paused or not. Play state lives in isPaused.
        */
       this.playerData = {
-        playing: this.playerResponse.is_playing,
+        playing: true,
         trackArtists: this.playerResponse.item.artists.map(
           artist => artist.name
         ),
