@@ -147,3 +147,31 @@
     }
   }
 }
+
+/**
+ * Idle photo rotation: full-screen photos that crossfade.
+ */
+.now-playing--idle {
+  overflow: hidden;
+  padding: 0;
+  position: relative;
+}
+
+.now-playing__idle-image {
+  height: 100%;
+  left: 0;
+  object-fit: cover;
+  position: absolute;
+  top: 0;
+  width: 100%;
+}
+
+.idle-fade-enter-active,
+.idle-fade-leave-active {
+  transition: opacity 1.5s ease;
+}
+
+.idle-fade-enter,
+.idle-fade-leave-to {
+  opacity: 0;
+}

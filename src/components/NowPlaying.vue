@@ -60,7 +60,18 @@
       </div>
     </div>
     <div v-else class="now-playing" :class="getNowPlayingClass()">
-      <h1 class="now-playing__idle-heading">No music is playing 😔</h1>
+      <transition name="idle-fade">
+        <img
+          v-if="currentIdleImage"
+          :key="currentIdleImage"
+          :src="currentIdleImage"
+          alt=""
+          class="now-playing__idle-image"
+        />
+      </transition>
+      <h1 v-if="!currentIdleImage" class="now-playing__idle-heading">
+        No music is playing 😔
+      </h1>
     </div>
   </div>
 </template>
@@ -74,6 +85,11 @@ import props from '@/utils/props.js'
  * How long the controls stay on screen after a tap (ms).
  */
 const CONTROLS_TIMEOUT = 5000
+
+/**
+ * How long each idle photo stays up before the next one (ms).
+ */
+const IDLE_ROTATE_MS = 60000
 
 export default {
   name: 'NowPlaying',
@@ -98,7 +114,12 @@ export default {
       isPaused: false,
       progressTick: '',
       controlsVisible: false,
-      controlsTimer: ''
+      controlsTimer: '',
+
+      // Idle photo rotation
+      idleImages: [],
+      idleIndex: 0,
+      idleTimer: ''
     }
   },
 
@@ -120,21 +141,59 @@ export default {
         return 0
       }
       return Math.min(100, (this.progressMs / this.durationMs) * 100)
+    },
+
+    /**
+     * The idle photo to show right now, or '' if there are none.
+     * @return {String}
+     */
+    currentIdleImage() {
+      return this.idleImages[this.idleIndex] || ''
     }
   },
 
   mounted() {
     this.setDataInterval()
     this.startProgressTick()
+    this.loadIdleImages()
   },
 
   beforeDestroy() {
     clearInterval(this.pollPlaying)
     clearInterval(this.progressTick)
     clearTimeout(this.controlsTimer)
+    clearInterval(this.idleTimer)
   },
 
   methods: {
+    /**
+     * Load the list of idle photos written at build time,
+     * shuffle it, and start rotating.
+     */
+    async loadIdleImages() {
+      try {
+        const response = await fetch('/idle/list.json', { cache: 'no-store' })
+        const images = response.ok ? await response.json() : []
+
+        // Shuffle so each day starts somewhere different.
+        for (let i = images.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1))
+          ;[images[i], images[j]] = [images[j], images[i]]
+        }
+
+        this.idleImages = images
+      } catch (error) {
+        this.idleImages = []
+      }
+
+      clearInterval(this.idleTimer)
+      this.idleTimer = setInterval(() => {
+        if (!this.player.playing && this.idleImages.length > 1) {
+          this.idleIndex = (this.idleIndex + 1) % this.idleImages.length
+        }
+      }, IDLE_ROTATE_MS)
+    },
+
     /**
      * Make the network request to Spotify to
      * get the current played track.
