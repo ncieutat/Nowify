@@ -119,7 +119,11 @@ export default {
       // Idle photo rotation
       idleImages: [],
       idleIndex: 0,
-      idleTimer: ''
+      idleTimer: '',
+
+      // Error handling
+      failureCount: 0,
+      resumeTimer: ''
     }
   },
 
@@ -163,6 +167,7 @@ export default {
     clearInterval(this.progressTick)
     clearTimeout(this.controlsTimer)
     clearInterval(this.idleTimer)
+    clearTimeout(this.resumeTimer)
   },
 
   methods: {
@@ -199,10 +204,10 @@ export default {
      * get the current played track.
      */
     async getNowPlaying() {
-      let data = {}
+      let response
 
       try {
-        const response = await fetch(
+        response = await fetch(
           `${this.endpoints.base}/${this.endpoints.nowPlaying}`,
           {
             headers: {
@@ -210,50 +215,104 @@ export default {
             }
           }
         )
-
-        /**
-         * Fetch error.
-         */
-        if (!response.ok) {
-          throw new Error(`An error has occured: ${response.status}`)
-        }
-
-        /**
-         * Spotify returns a 204 when no current device session is found.
-         * The connection was successful but there's no content to return.
-         */
-        if (response.status === 204) {
-          data = this.getEmptyPlayer()
-          this.playerData = data
-
-          this.$nextTick(() => {
-            this.$emit('spotifyTrackUpdated', data)
-          })
-
-          return
-        }
-
-        data = await response.json()
-
-        /**
-         * Sync progress and play state on every poll, not just on
-         * track change, so the bar stays accurate.
-         */
-        this.progressMs = data.progress_ms || 0
-        this.durationMs = data.item?.duration_ms || 0
-        this.isPaused = data.is_playing === false
-
-        this.playerResponse = data
       } catch (error) {
-        this.handleExpiredToken()
+        /**
+         * Network error (Wi-Fi blip, DNS, router restart).
+         * Not a login problem: keep the screen as it is and back off.
+         */
+        this.handleTemporaryError()
+        return
+      }
 
-        data = this.getEmptyPlayer()
+      /**
+       * 401 is the only response that means the access token expired.
+       */
+      if (response.status === 401) {
+        this.handleExpiredToken()
+        return
+      }
+
+      /**
+       * 429: Spotify is rate-limiting us. Wait as long as it asks.
+       */
+      if (response.status === 429) {
+        const retryAfter = parseInt(response.headers.get('Retry-After'), 10)
+        this.pausePolling((retryAfter > 0 ? retryAfter : 30) * 1000)
+        return
+      }
+
+      /**
+       * Any other error (5xx, 403...): temporary, retry with back-off.
+       */
+      if (!response.ok) {
+        this.handleTemporaryError()
+        return
+      }
+
+      this.failureCount = 0
+
+      /**
+       * Spotify returns a 204 when no current device session is found.
+       * The connection was successful but there's no content to return.
+       */
+      if (response.status === 204) {
+        const data = this.getEmptyPlayer()
         this.playerData = data
 
         this.$nextTick(() => {
           this.$emit('spotifyTrackUpdated', data)
         })
+
+        return
       }
+
+      let data
+
+      try {
+        data = await response.json()
+      } catch (error) {
+        this.handleTemporaryError()
+        return
+      }
+
+      /**
+       * Sync progress and play state on every poll, not just on
+       * track change, so the bar stays accurate.
+       */
+      this.progressMs = data.progress_ms || 0
+      this.durationMs = data.item?.duration_ms || 0
+      this.isPaused = data.is_playing === false
+
+      this.playerResponse = data
+    },
+
+    /**
+     * A failed poll that isn't an expired login.
+     * The first two failures are ignored (the next poll retries);
+     * after that, wait longer each time: 20s, 40s, 80s... up to 5 min.
+     */
+    handleTemporaryError() {
+      this.failureCount += 1
+
+      if (this.failureCount < 3) {
+        return
+      }
+
+      const delay = Math.min(5000 * 2 ** (this.failureCount - 1), 300000)
+      this.pausePolling(delay)
+    },
+
+    /**
+     * Stop polling for a while, then poll once and resume.
+     * @param {Number} ms - how long to wait.
+     */
+    pausePolling(ms) {
+      clearInterval(this.pollPlaying)
+      clearTimeout(this.resumeTimer)
+      this.resumeTimer = setTimeout(() => {
+        this.getNowPlaying()
+        this.setDataInterval()
+      }, ms)
     },
 
     /**

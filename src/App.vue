@@ -5,6 +5,7 @@
       :auth="auth"
       :endpoints="endpoints"
       :player="player"
+      :auto-refresh="autoRefresh"
       @spotifyTrackUpdated="updateCurrentTrack"
       @requestRefreshToken="requestRefreshTokens"
     ></Component>
@@ -51,7 +52,9 @@ export default {
         trackTitle: '',
         trackAlbum: []
       },
-      storedId: ''
+      storedId: '',
+      refreshLog: [],
+      autoRefresh: true
     }
   },
 
@@ -87,6 +90,20 @@ export default {
      * Request a refresh token from Spotify.
      */
     requestRefreshTokens() {
+      /**
+       * An access token lasts an hour, so more than 3 refreshes in
+       * 10 minutes means something is wrong. Stop the automatic loop
+       * and leave the login screen up instead of flipping back and forth.
+       */
+      const now = Date.now()
+      this.refreshLog = this.refreshLog
+        .filter(time => now - time < 10 * 60 * 1000)
+        .concat(now)
+
+      if (this.refreshLog.length > 3) {
+        this.autoRefresh = false
+      }
+
       this.auth.status = false
     },
 

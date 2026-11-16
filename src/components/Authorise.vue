@@ -7,6 +7,11 @@
       Pi. Login with Spotify below and start playing some music!
     </p>
 
+    <p v-if="!autoRefresh" class="authorise__copy">
+      The Spotify connection kept failing, so automatic login has paused. Log in
+      again below.
+    </p>
+
     <button
       class="authorise__button button button--authorise"
       @click="initAuthorise"
@@ -33,11 +38,17 @@ export default {
 
   props: {
     auth: props.auth,
-    endpoints: props.endpoints
+    endpoints: props.endpoints,
+    autoRefresh: {
+      type: Boolean,
+      default: true
+    }
   },
 
   data() {
-    return {}
+    return {
+      refreshAttempts: 0
+    }
   },
 
   computed: {},
@@ -51,7 +62,7 @@ export default {
     /**
      * Refresh token already exists - we must get a new one.
      */
-    if (this.auth.refreshToken) {
+    if (this.auth.refreshToken && this.autoRefresh) {
       this.requestAccessTokens('refresh_token')
     }
   },
@@ -104,16 +115,32 @@ export default {
         `${this.auth.clientId}:${this.auth.clientSecret}`
       )
 
-      const res = await fetch(`${this.endpoints.token}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${clientDetails}`
-        },
-        body: queryBody
-      })
+      let data
 
-      const data = await res.json()
+      try {
+        const res = await fetch(`${this.endpoints.token}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: `Basic ${clientDetails}`
+          },
+          body: queryBody
+        })
+
+        data = await res.json()
+      } catch (error) {
+        /**
+         * Network error while refreshing: retry up to 5 times,
+         * 30 seconds apart, then leave the login button up.
+         */
+        if (grantType === 'refresh_token' && this.refreshAttempts < 5) {
+          this.refreshAttempts += 1
+          setTimeout(() => this.requestAccessTokens('refresh_token'), 30000)
+        }
+
+        return
+      }
+
       const accessTokenResponse = data
 
       this.handleAccessTokenResponse(accessTokenResponse)
@@ -199,7 +226,10 @@ export default {
             .substring(5)
         ].join('-')
       )
-      searchParams.append('scope', 'user-read-currently-playing user-modify-playback-state')
+      searchParams.append(
+        'scope',
+        'user-read-currently-playing user-modify-playback-state'
+      )
 
       return `${this.endpoints.auth}?${searchParams.toString()}`
     }
