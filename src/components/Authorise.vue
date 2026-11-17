@@ -247,7 +247,16 @@ export default {
      * Watch authorisation status.
      */
     'auth.status': function() {
-      if (this.auth.refreshToken) {
+      /**
+       * Only refresh when the status drops to false while this screen is
+       * up, and never once automatic login has been paused. (The original
+       * also fired on success, sending a duplicate refresh every time.)
+       */
+      if (
+        this.auth.status === false &&
+        this.auth.refreshToken &&
+        this.autoRefresh
+      ) {
         this.requestAccessTokens('refresh_token')
       }
     }

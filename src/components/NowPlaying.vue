@@ -91,6 +91,17 @@ const CONTROLS_TIMEOUT = 5000
  */
 const IDLE_ROTATE_MS = 60000
 
+/**
+ * How often to ask Spotify what's playing (ms).
+ * The original polled every 2.5s around the clock (~35,000 requests a day),
+ * which tripped Spotify's rate limit overnight.
+ */
+const POLL_PLAYING_MS = 5000 // music playing: catch song changes quickly
+const POLL_IDLE_MS = 30000 // paused or nothing playing
+const POLL_NIGHT_MS = 300000 // nothing playing, between NIGHT_START and NIGHT_END
+const NIGHT_START = 1 // 1 am
+const NIGHT_END = 8 // 8 am
+
 export default {
   name: 'NowPlaying',
 
@@ -123,7 +134,10 @@ export default {
 
       // Error handling
       failureCount: 0,
-      resumeTimer: ''
+      resumeTimer: '',
+      lastStatus: '',
+      pollMs: 0,
+      activelyPlaying: false
     }
   },
 
@@ -157,6 +171,7 @@ export default {
   },
 
   mounted() {
+    this.getNowPlaying() // first check straight away, not after a full interval
     this.setDataInterval()
     this.startProgressTick()
     this.loadIdleImages()
@@ -164,6 +179,7 @@ export default {
 
   beforeDestroy() {
     clearInterval(this.pollPlaying)
+    this.pollPlaying = ''
     clearInterval(this.progressTick)
     clearTimeout(this.controlsTimer)
     clearInterval(this.idleTimer)
@@ -220,6 +236,7 @@ export default {
          * Network error (Wi-Fi blip, DNS, router restart).
          * Not a login problem: keep the screen as it is and back off.
          */
+        this.reportStatus('network-error')
         this.handleTemporaryError()
         return
       }
@@ -228,6 +245,7 @@ export default {
        * 401 is the only response that means the access token expired.
        */
       if (response.status === 401) {
+        this.reportStatus('401')
         this.handleExpiredToken()
         return
       }
@@ -236,8 +254,15 @@ export default {
        * 429: Spotify is rate-limiting us. Wait as long as it asks.
        */
       if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get('Retry-After'), 10)
-        this.pausePolling((retryAfter > 0 ? retryAfter : 30) * 1000)
+        /**
+         * Rate-limited. The browser can't read Spotify's Retry-After header
+         * (it isn't exposed to web pages), so back off on our own:
+         * 30s, 1 min, 2 min, 4 min... up to 15 min, until Spotify answers again.
+         */
+        this.failureCount += 1
+        const delay = Math.min(30000 * 2 ** (this.failureCount - 1), 900000)
+        this.reportStatus(`429 rate-limited, next try in ${delay / 1000}s`)
+        this.pausePolling(delay)
         return
       }
 
@@ -245,6 +270,13 @@ export default {
        * Any other error (5xx, 403...): temporary, retry with back-off.
        */
       if (!response.ok) {
+        let message = ''
+        try {
+          message = (await response.json()).error.message || ''
+        } catch (error) {
+          message = ''
+        }
+        this.reportStatus(`${response.status} ${message}`.slice(0, 100))
         this.handleTemporaryError()
         return
       }
@@ -256,6 +288,9 @@ export default {
        * The connection was successful but there's no content to return.
        */
       if (response.status === 204) {
+        this.reportStatus('204 nothing-playing')
+        this.activelyPlaying = false
+        this.setDataInterval()
         const data = this.getEmptyPlayer()
         this.playerData = data
 
@@ -279,11 +314,34 @@ export default {
        * Sync progress and play state on every poll, not just on
        * track change, so the bar stays accurate.
        */
+      this.reportStatus(
+        data.item
+          ? '200 playing'
+          : `200 no-track type=${data.currently_playing_type}`
+      )
+      this.activelyPlaying = Boolean(data.item) && data.is_playing === true
+      this.setDataInterval()
+
       this.progressMs = data.progress_ms || 0
       this.durationMs = data.item?.duration_ms || 0
       this.isPaused = data.is_playing === false
 
       this.playerResponse = data
+    },
+
+    /**
+     * Write each change in Spotify's response to the Pi's web server log,
+     * so `journalctl -u nowify` shows what Spotify is answering.
+     * The request itself gets a harmless 404; only the logged URL matters.
+     * @param {String} status - e.g. "200", "204", "403 User not registered".
+     */
+    reportStatus(status) {
+      if (status === this.lastStatus) {
+        return
+      }
+
+      this.lastStatus = status
+      fetch(`/poll-status?${encodeURIComponent(status)}`).catch(() => {})
     },
 
     /**
@@ -308,6 +366,7 @@ export default {
      */
     pausePolling(ms) {
       clearInterval(this.pollPlaying)
+      this.pollPlaying = ''
       clearTimeout(this.resumeTimer)
       this.resumeTimer = setTimeout(() => {
         this.getNowPlaying()
@@ -479,10 +538,36 @@ export default {
      * Poll Spotify for data.
      */
     setDataInterval() {
+      const ms = this.getPollRate()
+
+      // Already polling at this rate: leave the timer alone.
+      if (this.pollPlaying && ms === this.pollMs) {
+        return
+      }
+
       clearInterval(this.pollPlaying)
+      this.pollPlaying = ''
+      this.pollMs = ms
       this.pollPlaying = setInterval(() => {
         this.getNowPlaying()
-      }, 2500)
+      }, ms)
+    },
+
+    /**
+     * Pick the polling rate from what the last answer said.
+     * @return {Number} ms between polls.
+     */
+    getPollRate() {
+      if (this.activelyPlaying) {
+        return POLL_PLAYING_MS
+      }
+
+      const hour = new Date().getHours()
+      if (hour >= NIGHT_START && hour < NIGHT_END) {
+        return POLL_NIGHT_MS
+      }
+
+      return POLL_IDLE_MS
     },
 
     /**
@@ -581,6 +666,7 @@ export default {
      */
     handleExpiredToken() {
       clearInterval(this.pollPlaying)
+      this.pollPlaying = ''
       this.$emit('requestRefreshToken')
     }
   },
@@ -591,6 +677,7 @@ export default {
     auth: function(oldVal, newVal) {
       if (newVal.status === false) {
         clearInterval(this.pollPlaying)
+        this.pollPlaying = ''
       }
     },
 
